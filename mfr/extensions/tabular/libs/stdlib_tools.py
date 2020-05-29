@@ -1,18 +1,32 @@
 import re
 import csv
+import logging
 
-from mfr.extensions.tabular.exceptions import EmptyTableError, TabularRendererError
 from mfr.extensions.tabular import utilities
+from mfr.extensions.tabular.settings import MAX_FILE_SIZE, TABULAR_INIT_SNIFF_SIZE
+from mfr.extensions.tabular.exceptions import EmptyTableError, TabularRendererError
+
+logger = logging.getLogger(__name__)
 
 
 def csv_stdlib(fp):
     """Read and convert a csv file to JSON format using the python standard library
-    :param fp: File pointer object
-    :return: tuple of table headers and data
+
+    Quirk: ``csv.Sniffer().sniff()`` needs the FULL first row and ONLY one full row to be able to
+    effectively detect the correct dialect of the file.
+
+    :param fp: the file pointer object
+    :return: a tuple of table headers and data
     """
-    data = fp.read(2048)
+
+    # Prepare the first row for sniffing
+    data = fp.read(TABULAR_INIT_SNIFF_SIZE)
+    data = _trim_or_append_data(fp, data, TABULAR_INIT_SNIFF_SIZE, 0)
+
+    # Reset the file pointer
     fp.seek(0)
 
+    # Sniff the first row to find a matching format
     try:
         dialect = csv.Sniffer().sniff(data)
     except csv.Error:
@@ -20,10 +34,14 @@ def csv_stdlib(fp):
     else:
         _set_dialect_quote_attrs(dialect, data)
 
+    # Explicitly delete data when it is on longer used.
     del data
+
+    # Create the CSV reader with the detected dialect
     reader = csv.DictReader(fp, dialect=dialect)
+
+    # Update the reader field names to avoid duplicate column names when performing row extraction
     columns = []
-    # update the reader field names to avoid duplicate column names when performing row extraction
     for idx, fieldname in enumerate(reader.fieldnames or []):
         column_count = sum(1 for column in columns if fieldname == column['name'])
         if column_count:
@@ -92,3 +110,62 @@ def _set_dialect_quote_attrs(dialect, data):
             dialect.quotechar = '"'
         if re.search('"""[[({]\'.+\',', data):
             dialect.doublequote = True
+
+
+def _trim_or_append_data(fp, text, read_size, sniff_size):
+    """Recursively read data from a file and return its first row. The file starts with ``text``
+    and the file pointer points to the next character immediately after `text`.
+
+    :param fp: the file pointer from which data is read
+    :param text: the current text chunk to check the new line character
+    :param read_size: the last read size when `fp.read()` is called
+    :param sniff_size: the accumulated size fo the text to sniff
+    :return: the first row of the file in string
+    """
+
+    logger.info('>>> ??? &&& ~~~ _trim_or_append_data() ...')
+    logger.info('>>> ??? &&& ~~~ len(text)={}\tread_size={}\tsniff_size={}'
+                .format(len(text), read_size, sniff_size))
+
+    # Try to find the first new line character in the text chunk
+    index = _find_new_line(text)
+    # If found, return the trimmed substring
+    if index != -1:
+        logger.info('>>> ??? &&& ~~~ new line found @ index = {}, '
+                    'return the trimmed text'.format(index))
+        return text[:index]
+    # Otherwise, update `sniff_size` and then sniff more (2 times of the last `read_size`) text
+    sniff_size += read_size
+    read_size *= 2
+    more_text = fp.read(read_size)
+
+    # If text to sniff now goes over the max file size limit, raise the renderer error since there
+    # is no need to sniff when the file is already too large to be rendered.
+    if sniff_size + len(more_text) >= MAX_FILE_SIZE:
+        raise TabularRendererError(
+            'The first row of this file is too large for the sniffer to detect the dialect. '
+            'Please download and view it locally.',
+            code=400,
+            extension='csv'
+        )
+    # If the size is still within the limit, recursively check `more_text`
+    logger.info('>>> ??? &&& ~~~ sniff more text')
+    return text + _trim_or_append_data(fp, more_text, read_size, sniff_size)
+
+
+def _find_new_line(text):
+    """Check the text string for any type of new line character.
+
+    :param text: the text string to check
+    :return: the index of the new line character if found. Otherwise, return -1.
+    """
+
+    index = text.rfind('\r\n')
+    if index == -1:
+        index = text.rfind('\n')
+        if index == -1:
+            index = text.rfind('\r')
+
+    logger.info('>>> ??? ### new line index = {}'.format(index))
+
+    return index
